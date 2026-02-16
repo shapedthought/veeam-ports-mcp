@@ -6,7 +6,9 @@ Wraps the REST API at magicports.veeambp.com/ports_server/.
 
 from __future__ import annotations
 
+import json
 import logging
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -67,7 +69,10 @@ mcp = FastMCP(
         "- Subheadings represent product components (e.g. 'Backup Server', "
         "'Proxy Server'). Use get_product_subheadings to see the structure.\n"
         "- When asked about firewall rules, present results as a clear table "
-        "with source, target, port, and protocol columns."
+        "with source, target, port, and protocol columns.\n"
+        "- Use generate_app_import to create JSON that can be imported into "
+        "the Magic Ports frontend app. First call get_source_details to see "
+        "available services, then ask the user which servers they have."
     ),
     lifespan=app_lifespan,
 )
@@ -279,6 +284,223 @@ async def get_source_details(product_name: str, ctx: Context) -> str:
         parts.append("")
 
     return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# App import generator
+# ---------------------------------------------------------------------------
+
+def _find_server(
+    service_name: str,
+    server_map: dict[str, dict],
+) -> str | None:
+    """Find which server a service name belongs to."""
+    for srv_name, srv in server_map.items():
+        for svc in srv["services"]:
+            if svc.lower() == service_name.lower():
+                return srv_name
+    # Fallback: substring match
+    for srv_name, srv in server_map.items():
+        for svc in srv["services"]:
+            if svc.lower() in service_name.lower():
+                return srv_name
+    return None
+
+
+def _build_app_import(
+    port_entries: list[dict[str, Any]],
+    servers: list[dict[str, Any]],
+    product: str,
+) -> list[dict[str, Any]]:
+    """Build the frontend app import JSON structure."""
+    # Create server records with UUIDs
+    server_map: dict[str, dict] = {}
+    for srv in servers:
+        srv_id = str(uuid.uuid4())
+        server_map[srv["name"]] = {
+            "id": srv_id,
+            "services": srv["services"],
+            "mappedPorts": [],
+        }
+
+    # Match each port entry to source and target servers
+    for entry in port_entries:
+        src_service = entry.get("sourceService", "")
+        tgt_service = entry.get("targetService", "")
+        src_server = _find_server(src_service, server_map)
+        tgt_server = _find_server(tgt_service, server_map)
+
+        if not src_server:
+            continue
+
+        src_id = server_map[src_server]["id"]
+        tgt_name = tgt_server if tgt_server else tgt_service
+
+        server_map[src_server]["mappedPorts"].append({
+            "sourceServerId": src_id,
+            "sourceServerName": src_server,
+            "targetServerName": tgt_name,
+            "sourceService": src_service,
+            "targetService": tgt_service,
+            "description": entry.get("description", ""),
+            "product": product,
+            "port": entry.get("port", ""),
+            "protocol": entry.get("protocol", ""),
+        })
+
+    # Build inbound map: for each server, find all ports targeting it
+    inbound_map: dict[str, list[dict]] = {name: [] for name in server_map}
+    for srv_name, srv in server_map.items():
+        for mp in srv["mappedPorts"]:
+            tgt = mp["targetServerName"]
+            if tgt in inbound_map:
+                inbound_map[tgt].append(mp)
+
+    # Build the output structure
+    result = []
+    for srv_name, srv in server_map.items():
+        mapped = srv["mappedPorts"]
+
+        # Outbound ports by protocol
+        out_tcp = []
+        out_udp = []
+        for mp in mapped:
+            port = mp["port"]
+            proto = mp.get("protocol", "").upper()
+            if "TCP" in proto and port not in out_tcp:
+                out_tcp.append(port)
+            if "UDP" in proto and port not in out_udp:
+                out_udp.append(port)
+
+        # Inbound ports by protocol
+        inbound = inbound_map[srv_name]
+        in_tcp = []
+        in_udp = []
+        for mp in inbound:
+            port = mp["port"]
+            proto = mp.get("protocol", "").upper()
+            if "TCP" in proto and port not in in_tcp:
+                in_tcp.append(port)
+            if "UDP" in proto and port not in in_udp:
+                in_udp.append(port)
+
+        # Group outbound by target server + protocol
+        outbound_grouped: dict[str, dict[str, list[str]]] = {}
+        for mp in mapped:
+            tgt = mp["targetServerName"]
+            proto = mp.get("protocol", "").upper()
+            outbound_grouped.setdefault(tgt, {}).setdefault(proto, [])
+            if mp["port"] not in outbound_grouped[tgt][proto]:
+                outbound_grouped[tgt][proto].append(mp["port"])
+
+        mapped_by_proto = []
+        idx = 0
+        for tgt, protocols in outbound_grouped.items():
+            for proto, ports in protocols.items():
+                mapped_by_proto.append({
+                    "index": idx,
+                    "serverName": tgt,
+                    "service": "",
+                    "protocol": proto,
+                    "port": ", ".join(ports),
+                })
+                idx += 1
+
+        # Group inbound by source server + protocol
+        inbound_grouped: dict[str, dict[str, list[str]]] = {}
+        for mp in inbound:
+            src = mp["sourceServerName"]
+            proto = mp.get("protocol", "").upper()
+            inbound_grouped.setdefault(src, {}).setdefault(proto, [])
+            if mp["port"] not in inbound_grouped[src][proto]:
+                inbound_grouped[src][proto].append(mp["port"])
+
+        mapped_by_proto_in = []
+        idx = 0
+        for src, protocols in inbound_grouped.items():
+            for proto, ports in protocols.items():
+                mapped_by_proto_in.append({
+                    "index": idx,
+                    "serverName": src,
+                    "service": "",
+                    "protocol": proto,
+                    "port": ", ".join(ports),
+                })
+                idx += 1
+
+        # Count unique target servers
+        unique_targets = set(mp["targetServerName"] for mp in mapped)
+
+        result.append({
+            "id": srv["id"],
+            "sourceServer": srv_name,
+            "totalMappedPorts": len(mapped),
+            "totalMappedInboundPorts": len(inbound),
+            "totalMappedServers": len(unique_targets),
+            "mappedPorts": mapped,
+            "allInboundPortsTcp": in_tcp,
+            "allInboundPortsUdp": in_udp,
+            "allOutboundPortsTcp": out_tcp,
+            "allOutboundPortsUdp": out_udp,
+            "mappedPortsByProtocol": mapped_by_proto,
+            "mappedPortsByProtocolInbound": mapped_by_proto_in,
+        })
+
+    return result
+
+
+@mcp.tool()
+async def generate_app_import(
+    product_name: str,
+    servers_json: str,
+    ctx: Context,
+) -> str:
+    """Generate a JSON file for importing into the Magic Ports frontend app.
+
+    Creates the port mapping topology structure that the Angular frontend
+    can import. You must define the servers in your environment and which
+    services each server provides.
+
+    Workflow:
+    1. Call get_source_details to see available services for the product.
+    2. Ask the user which servers they have and what roles they serve.
+    3. Call this tool with the server definitions.
+    4. The user saves the returned JSON to a file and imports it
+       into the Magic Ports app.
+
+    Args:
+        product_name: Exact product name (e.g. 'VBR v13', 'VB365')
+        servers_json: JSON array of server definitions. Each object must
+            have 'name' (server label) and 'services' (list of service
+            names this server provides). Example:
+            [
+              {"name": "VBR", "services": ["Backup server"]},
+              {"name": "Proxy", "services": ["Backup proxy"]},
+              {"name": "Repo", "services": ["Backup repository"]},
+              {"name": "ESXi", "services": ["ESXi server", "vCenter Server"]}
+            ]
+    """
+    client = _get_client(ctx)
+
+    try:
+        servers = json.loads(servers_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid servers_json: {exc}")
+
+    if not isinstance(servers, list):
+        raise ValueError("servers_json must be a JSON array.")
+    for srv in servers:
+        if "name" not in srv or "services" not in srv:
+            raise ValueError(
+                "Each server must have 'name' and 'services' fields."
+            )
+
+    entries = await _api_get(client, f"/products/{product_name}/ports")
+    if not entries:
+        return f"No port data found for product '{product_name}'."
+
+    result = _build_app_import(entries, servers, product_name)
+    return json.dumps(result, indent=2)
 
 
 # ---------------------------------------------------------------------------
