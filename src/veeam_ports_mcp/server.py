@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -21,6 +24,13 @@ logger = logging.getLogger(__name__)
 
 API_BASE = "https://magicports.veeambp.com/ports_server"
 REQUEST_TIMEOUT = 30.0
+
+# Directory for generated import files.
+# Falls back to system temp if the preferred path doesn't exist or can't be created.
+OUTPUT_DIR = os.environ.get(
+    "VEEAM_PORTS_OUTPUT_DIR",
+    str(Path.home() / "Documents" / "veeam-ports-exports"),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -70,9 +80,11 @@ mcp = FastMCP(
         "'Proxy Server'). Use get_product_subheadings to see the structure.\n"
         "- When asked about firewall rules, present results as a clear table "
         "with source, target, port, and protocol columns.\n"
-        "- Use generate_app_import to create JSON that can be imported into "
-        "the Magic Ports frontend app. First call get_source_details to see "
-        "available services, then ask the user which servers they have."
+        "- Use generate_app_import to create a JSON import file for the "
+        "Magic Ports frontend app. The tool writes the file to disk and "
+        "returns the file path + summary. Present the file to the user "
+        "for download. First call get_source_details to see available "
+        "services, then ask the user which servers they have."
     ),
     lifespan=app_lifespan,
 )
@@ -84,6 +96,17 @@ mcp = FastMCP(
 
 def _get_client(ctx: Context) -> httpx.AsyncClient:
     return ctx.request_context.lifespan_context.client
+
+
+def _get_output_dir() -> str:
+    """Get (and create if needed) the output directory for generated files."""
+    d = OUTPUT_DIR
+    if not os.path.isdir(d):
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            d = tempfile.gettempdir()
+    return d
 
 
 async def _api_get(
@@ -515,6 +538,7 @@ async def generate_app_import(
     product_name: str,
     servers_json: str,
     ctx: Context,
+    output_dir: str | None = None,
 ) -> str:
     """Generate a JSON file for importing into the Magic Ports frontend app.
 
@@ -522,12 +546,15 @@ async def generate_app_import(
     can import. You must define the servers in your environment and which
     services each server provides.
 
+    The full JSON is written to a file on disk. The tool returns the file
+    path and a summary of the generated data. Present the file path to the
+    user so they can import it into the Magic Ports app.
+
     Workflow:
     1. Call get_source_details to see available services for the product.
     2. Ask the user which servers they have and what roles they serve.
     3. Call this tool with the server definitions.
-    4. The user saves the returned JSON to a file and imports it
-       into the Magic Ports app.
+    4. Present the generated file to the user for download/import.
 
     Args:
         product_name: Exact product name (e.g. 'VBR v13', 'VB365')
@@ -540,6 +567,8 @@ async def generate_app_import(
               {"name": "Repo", "services": ["Backup repository"]},
               {"name": "ESXi", "services": ["ESXi server", "vCenter Server"]}
             ]
+        output_dir: Optional directory to write the file to. Defaults to
+            ~/Documents/veeam-ports-exports or VEEAM_PORTS_OUTPUT_DIR env var.
     """
     client = _get_client(ctx)
 
@@ -561,7 +590,52 @@ async def generate_app_import(
         return f"No port data found for product '{product_name}'."
 
     result = _build_app_import(entries, servers, product_name)
-    return json.dumps(result, indent=2)
+
+    # Write full JSON to file, return compact summary
+    if output_dir:
+        dest = output_dir
+        os.makedirs(dest, exist_ok=True)
+    else:
+        dest = _get_output_dir()
+
+    safe_product = product_name.replace(" ", "-").lower()
+    filename = f"magic-ports-{safe_product}-import.json"
+    filepath = os.path.join(dest, filename)
+
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
+
+    file_size = os.path.getsize(filepath)
+
+    # Build compact summary for the LLM
+    summary_lines = [
+        "Import file generated successfully.",
+        "",
+        f"File: {filepath}",
+        f"Size: {file_size:,} bytes",
+        f"Product: {product_name}",
+        f"Servers: {len(result)}",
+        "",
+    ]
+
+    for srv in result:
+        mapped_count = len(srv.get("mappedPorts", []))
+        inbound_count = srv.get("totalMappedInboundPorts", 0)
+        target_count = srv.get("totalMappedServers", 0)
+        summary_lines.append(
+            f"  {srv['sourceServer']}: "
+            f"{mapped_count} outbound ports, "
+            f"{inbound_count} inbound ports, "
+            f"{target_count} target servers"
+        )
+
+    summary_lines.append("")
+    summary_lines.append(
+        "Present this file to the user for download. "
+        "They can import it into the Magic Ports app."
+    )
+
+    return "\n".join(summary_lines)
 
 
 # ---------------------------------------------------------------------------
