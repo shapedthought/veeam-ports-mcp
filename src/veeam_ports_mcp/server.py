@@ -50,9 +50,24 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
 mcp = FastMCP(
     "Veeam Ports",
     instructions=(
-        "Query network port requirements for Veeam products. "
-        "Provides port, protocol, source/target service, and description "
-        "for firewall configuration and network planning."
+        "You have access to Veeam product network port requirement data. "
+        "Use these tools to answer questions about firewall rules, "
+        "required ports, protocols, and network connectivity for Veeam products.\n\n"
+        "Workflow:\n"
+        "1. Call list_products first to discover valid product names.\n"
+        "2. Product names must match exactly (e.g. 'VBR v13', not 'VBR' or 'Veeam Backup').\n"
+        "3. Use search_ports for broad questions across all products "
+        "(e.g. 'which products use SMTP').\n"
+        "4. Use get_product_ports to get all port data for a specific product.\n"
+        "5. Use search_by_port_number to find all products using a given port "
+        "(e.g. '443', '9392').\n\n"
+        "Tips:\n"
+        "- Port entries include source service, target service, port, protocol, "
+        "and description fields.\n"
+        "- Subheadings represent product components (e.g. 'Backup Server', "
+        "'Proxy Server'). Use get_product_subheadings to see the structure.\n"
+        "- When asked about firewall rules, present results as a clear table "
+        "with source, target, port, and protocol columns."
     ),
     lifespan=app_lifespan,
 )
