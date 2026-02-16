@@ -290,20 +290,81 @@ async def get_source_details(product_name: str, ctx: Context) -> str:
 # App import generator
 # ---------------------------------------------------------------------------
 
+def _normalise_service(name: str) -> str:
+    """Strip OS qualifiers for fuzzy matching."""
+    lower = name.lower().strip()
+    for suffix in ("(microsoft windows)", "(linux)", "(linux/unix)"):
+        lower = lower.replace(suffix, "").strip()
+    return lower
+
+
+def _has_conflicting_os(entry_service: str, server_service: str) -> bool:
+    """Check if a port entry's service specifies an OS that conflicts
+    with the user's server service.
+
+    Returns True if the entry is explicitly for a DIFFERENT OS than what
+    the server provides. Generic entries (no OS qualifier) never conflict.
+    """
+    entry_lower = entry_service.lower()
+    server_lower = server_service.lower()
+
+    os_tags = {
+        "(microsoft windows)": "windows",
+        "(linux)": "linux",
+        "(linux/unix)": "linux",
+    }
+
+    entry_os = None
+    server_os = None
+
+    for tag, os_name in os_tags.items():
+        if tag in entry_lower:
+            entry_os = os_name
+        if tag in server_lower:
+            server_os = os_name
+
+    # Only conflict if BOTH have an OS and they differ
+    if entry_os and server_os and entry_os != server_os:
+        return True
+
+    return False
+
+
 def _find_server(
     service_name: str,
     server_map: dict[str, dict],
 ) -> str | None:
-    """Find which server a service name belongs to."""
+    """Find which user-defined server a port entry's service belongs to.
+
+    Matching priority:
+    1. Exact match (case-insensitive)
+    2. Normalised match (strip OS qualifiers), with OS conflict rejection
+    3. Bidirectional substring match, with OS conflict rejection
+    """
+    svc_lower = service_name.lower().strip()
+    svc_norm = _normalise_service(service_name)
+
+    # Pass 1: exact match (case-insensitive)
     for srv_name, srv in server_map.items():
         for svc in srv["services"]:
-            if svc.lower() == service_name.lower():
+            if svc.lower().strip() == svc_lower:
                 return srv_name
-    # Fallback: substring match
+
+    # Pass 2: normalised match (e.g. "Backup proxy" matches "Backup proxy (Linux)")
     for srv_name, srv in server_map.items():
         for svc in srv["services"]:
-            if svc.lower() in service_name.lower():
-                return srv_name
+            if _normalise_service(svc) == svc_norm:
+                if not _has_conflicting_os(service_name, svc):
+                    return srv_name
+
+    # Pass 3: bidirectional substring on normalised names (with OS conflict check)
+    for srv_name, srv in server_map.items():
+        for svc in srv["services"]:
+            srv_norm = _normalise_service(svc)
+            if srv_norm in svc_norm or svc_norm in srv_norm:
+                if not _has_conflicting_os(service_name, svc):
+                    return srv_name
+
     return None
 
 
