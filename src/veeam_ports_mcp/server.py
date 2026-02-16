@@ -414,11 +414,13 @@ def _build_app_import(
         src_server = _find_server(src_service, server_map)
         tgt_server = _find_server(tgt_service, server_map)
 
-        if not src_server:
+        if not src_server or not tgt_server:
+            continue
+        if src_server == tgt_server:
             continue
 
         src_id = server_map[src_server]["id"]
-        tgt_name = tgt_server if tgt_server else tgt_service
+        tgt_name = tgt_server
 
         server_map[src_server]["mappedPorts"].append({
             "sourceServerId": src_id,
