@@ -13,9 +13,13 @@ This server wraps the [Veeam Magic Ports](https://magicports.veeambp.com) API, g
 | `list_products` | List all Veeam products with port data |
 | `get_product_ports` | Get all port requirements for a product |
 | `get_product_subheadings` | Get section headings for a product |
-| `search_ports` | Free-text search across all products |
+| `search_ports` | Free-text keyword search across all products |
 | `search_by_port_number` | Find entries using a specific port |
 | `get_source_details` | Source services grouped by section |
+| `semantic_search` | Natural language search with vector similarity |
+| `get_enriched_ports` | Port data with LLM-parsed service metadata |
+| `generate_topology` | Resolve firewall rules between named servers |
+| `generate_app_import` | Generate JSON import file for Magic Ports app |
 
 ## Installation
 
@@ -73,8 +77,9 @@ For Claude Desktop with a local dev install:
 - "What ports does VBR v13 need?"
 - "Which Veeam products use port 443?"
 - "Show me the firewall rules for VB365"
-- "What SMTP ports are used across Veeam products?"
-- "List the network requirements for the Veeam backup server component"
+- "What ports does the proxy need for VMware?"
+- "Generate firewall rules for my VBR, proxy, and ESXi servers"
+- "Create a Magic Ports import file for my environment"
 
 ## Debugging
 

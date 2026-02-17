@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from veeam_ports_mcp.server import _build_app_import, _get_output_dir
+from veeam_ports_mcp.server import _get_output_dir
 
 
 # ---------------------------------------------------------------------------
@@ -35,66 +35,140 @@ class TestGetOutputDir:
 
 
 # ---------------------------------------------------------------------------
-# _build_app_import structure
+# App import response handling
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture()
-def sample_port_entries():
-    return [
-        {
-            "sourceService": "Backup server",
-            "targetService": "Backup proxy (Linux)",
-            "port": "22",
-            "protocol": "TCP",
-            "description": "SSH control channel",
-            "subheading": "Backup Server",
-        },
-        {
-            "sourceService": "Backup server",
-            "targetService": "Backup proxy (Linux)",
-            "port": "6162, 2500 to 3300",
-            "protocol": "TCP",
-            "description": "Veeam Transport Service",
-            "subheading": "Backup Server",
-        },
-    ]
+SAMPLE_APP_IMPORT_RESPONSE = [
+    {
+        "id": "uuid-1",
+        "sourceServer": "VBR",
+        "totalMappedPorts": 2,
+        "totalMappedInboundPorts": 0,
+        "totalMappedServers": 1,
+        "mappedPorts": [
+            {
+                "sourceServerId": "uuid-1",
+                "sourceServerName": "VBR",
+                "targetServerName": "Proxy",
+                "sourceService": "Backup server",
+                "targetService": "Backup proxy (Linux)",
+                "description": "SSH control channel",
+                "product": "VBR v13",
+                "port": "22",
+                "protocol": "TCP",
+            },
+            {
+                "sourceServerId": "uuid-1",
+                "sourceServerName": "VBR",
+                "targetServerName": "Proxy",
+                "sourceService": "Backup server",
+                "targetService": "Backup proxy (Linux)",
+                "description": "Veeam Transport Service",
+                "product": "VBR v13",
+                "port": "6162",
+                "protocol": "TCP",
+            },
+        ],
+        "allInboundPortsTcp": [],
+        "allOutboundPortsTcp": ["22", "6162"],
+        "allInboundPortsUdp": [],
+        "allOutboundPortsUdp": [],
+        "mappedPortsByProtocol": [
+            {"index": 0, "serverName": "Proxy", "service": "", "protocol": "TCP", "port": "22"},
+            {"index": 1, "serverName": "Proxy", "service": "", "protocol": "TCP", "port": "6162"},
+        ],
+        "mappedPortsByProtocolInbound": [],
+    },
+    {
+        "id": "uuid-2",
+        "sourceServer": "Proxy",
+        "totalMappedPorts": 2,
+        "totalMappedInboundPorts": 2,
+        "totalMappedServers": 1,
+        "mappedPorts": [
+            {
+                "sourceServerId": "uuid-2",
+                "sourceServerName": "Proxy",
+                "targetServerName": "VBR",
+                "sourceService": "Backup proxy (Linux)",
+                "targetService": "Backup server",
+                "description": "SSH control channel",
+                "product": "VBR v13",
+                "port": "22",
+                "protocol": "TCP",
+            },
+            {
+                "sourceServerId": "uuid-2",
+                "sourceServerName": "Proxy",
+                "targetServerName": "VBR",
+                "sourceService": "Backup proxy (Linux)",
+                "targetService": "Backup server",
+                "description": "Veeam Transport Service",
+                "product": "VBR v13",
+                "port": "6162",
+                "protocol": "TCP",
+            },
+        ],
+        "allInboundPortsTcp": ["22", "6162"],
+        "allOutboundPortsTcp": [],
+        "allInboundPortsUdp": [],
+        "allOutboundPortsUdp": [],
+        "mappedPortsByProtocol": [],
+        "mappedPortsByProtocolInbound": [
+            {"index": 0, "serverName": "VBR", "service": "", "protocol": "TCP", "port": "22"},
+            {"index": 1, "serverName": "VBR", "service": "", "protocol": "TCP", "port": "6162"},
+        ],
+    },
+]
 
 
-@pytest.fixture()
-def sample_servers():
-    return [
-        {"name": "VBR", "services": ["Backup server"]},
-        {"name": "Proxy", "services": ["Backup proxy (Linux)"]},
-    ]
+class TestAppImportResponseStructure:
+    """Verify that app-import API response fields are compatible with summary code."""
 
-
-class TestBuildAppImport:
-    def test_returns_list_of_server_records(self, sample_port_entries, sample_servers):
-        result = _build_app_import(sample_port_entries, sample_servers, "VBR v13")
-        assert isinstance(result, list)
-        assert len(result) == 2
-        for srv in result:
-            assert "id" in srv
+    def test_servers_have_required_fields(self):
+        for srv in SAMPLE_APP_IMPORT_RESPONSE:
             assert "sourceServer" in srv
             assert "mappedPorts" in srv
-            assert isinstance(srv["mappedPorts"], list)
+            assert "totalMappedInboundPorts" in srv
+            assert "totalMappedServers" in srv
 
-    def test_output_is_valid_json(self, sample_port_entries, sample_servers, tmp_path):
-        result = _build_app_import(sample_port_entries, sample_servers, "VBR v13")
+    def test_mapped_ports_have_required_fields(self):
+        for srv in SAMPLE_APP_IMPORT_RESPONSE:
+            for mp in srv["mappedPorts"]:
+                assert "sourceServerId" in mp
+                assert "sourceServerName" in mp
+                assert "targetServerName" in mp
+                assert "sourceService" in mp
+                assert "targetService" in mp
+                assert "product" in mp
+                assert "port" in mp
+                assert "protocol" in mp
+                assert "description" in mp
+                assert "server" not in mp
+                assert "direction" not in mp
+
+    def test_ports_by_protocol_have_required_fields(self):
+        for srv in SAMPLE_APP_IMPORT_RESPONSE:
+            for entry in srv["mappedPortsByProtocol"] + srv["mappedPortsByProtocolInbound"]:
+                assert "index" in entry
+                assert "serverName" in entry
+                assert "service" in entry
+                assert "protocol" in entry
+                assert "port" in entry
+                assert isinstance(entry["port"], str)
+                assert "ports" not in entry
+
+    def test_file_roundtrip(self, tmp_path):
+        """Verify app-import servers can be written as JSON and loaded back."""
         filepath = tmp_path / "test-import.json"
         with open(filepath, "w") as f:
-            json.dump(result, f, indent=2)
+            json.dump(SAMPLE_APP_IMPORT_RESPONSE, f, indent=2)
 
         with open(filepath) as f:
             loaded = json.load(f)
 
         assert len(loaded) == 2
-        assert loaded[0]["sourceServer"] in ("VBR", "Proxy")
+        assert loaded[0]["sourceServer"] == "VBR"
+        assert len(loaded[0]["mappedPorts"]) == 2
         assert all("mappedPorts" in s for s in loaded)
-
-    def test_vbr_has_outbound_ports(self, sample_port_entries, sample_servers):
-        result = _build_app_import(sample_port_entries, sample_servers, "VBR v13")
-        vbr = next(s for s in result if s["sourceServer"] == "VBR")
-        assert len(vbr["mappedPorts"]) > 0
-        assert vbr["totalMappedPorts"] > 0

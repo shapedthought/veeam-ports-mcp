@@ -10,7 +10,7 @@ import json
 import logging
 import os
 import tempfile
-import uuid
+
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -22,7 +22,9 @@ from mcp.server.fastmcp import Context, FastMCP
 
 logger = logging.getLogger(__name__)
 
-API_BASE = "https://magicports.veeambp.com/ports_server"
+API_BASE = os.environ.get(
+    "VEEAM_PORTS_API_BASE", "https://magicports.veeambp.com/ports_server"
+)
 REQUEST_TIMEOUT = 30.0
 
 # Directory for generated import files.
@@ -68,23 +70,27 @@ mcp = FastMCP(
         "Workflow:\n"
         "1. Call list_products first to discover valid product names.\n"
         "2. Product names must match exactly (e.g. 'VBR v13', not 'VBR' or 'Veeam Backup').\n"
-        "3. Use search_ports for broad questions across all products "
-        "(e.g. 'which products use SMTP').\n"
-        "4. Use get_product_ports to get all port data for a specific product.\n"
-        "5. Use search_by_port_number to find all products using a given port "
-        "(e.g. '443', '9392').\n\n"
+        "3. Use semantic_search for natural language questions — it handles "
+        "synonyms and related concepts (e.g. 'firewall rules for backup to NAS').\n"
+        "4. Use get_product_ports or get_enriched_ports for exhaustive port data.\n"
+        "5. Use search_ports for broad keyword searches across all products.\n"
+        "6. Use search_by_port_number to find all products using a given port.\n\n"
+        "Server topology:\n"
+        "- Use generate_topology when the user describes their server layout "
+        "and wants to know what firewall rules are needed between servers.\n"
+        "- Use generate_app_import to create a JSON import file for the "
+        "Magic Ports frontend app. The tool writes the file to disk and "
+        "returns the file path + summary. Present the file to the user "
+        "for download.\n"
+        "- For both tools, first call get_source_details to see available "
+        "services, then ask the user which servers they have.\n\n"
         "Tips:\n"
         "- Port entries include source service, target service, port, protocol, "
         "and description fields.\n"
         "- Subheadings represent product components (e.g. 'Backup Server', "
         "'Proxy Server'). Use get_product_subheadings to see the structure.\n"
         "- When asked about firewall rules, present results as a clear table "
-        "with source, target, port, and protocol columns.\n"
-        "- Use generate_app_import to create a JSON import file for the "
-        "Magic Ports frontend app. The tool writes the file to disk and "
-        "returns the file path + summary. Present the file to the user "
-        "for download. First call get_source_details to see available "
-        "services, then ask the user which servers they have."
+        "with source, target, port, and protocol columns."
     ),
     lifespan=app_lifespan,
 )
@@ -310,230 +316,257 @@ async def get_source_details(product_name: str, ctx: Context) -> str:
 
 
 # ---------------------------------------------------------------------------
-# App import generator
+# Enriched / semantic tools
 # ---------------------------------------------------------------------------
 
-def _normalise_service(name: str) -> str:
-    """Strip OS qualifiers for fuzzy matching."""
-    lower = name.lower().strip()
-    for suffix in ("(microsoft windows)", "(linux)", "(linux/unix)"):
-        lower = lower.replace(suffix, "").strip()
-    return lower
+@mcp.tool()
+async def semantic_search(
+    query: str,
+    ctx: Context,
+    product_name: str | None = None,
+    limit: int = 20,
+) -> str:
+    """Search port requirements using natural language (vector similarity).
 
+    Understands synonyms and related concepts — e.g. 'firewall rules for
+    backup to NAS' matches NFS/SMB repository entries even if those exact
+    words don't appear in the data.
 
-def _has_conflicting_os(entry_service: str, server_service: str) -> bool:
-    """Check if a port entry's service specifies an OS that conflicts
-    with the user's server service.
+    Falls back to keyword search if vector embeddings are unavailable.
 
-    Returns True if the entry is explicitly for a DIFFERENT OS than what
-    the server provides. Generic entries (no OS qualifier) never conflict.
+    Args:
+        query: Natural language search query (e.g. 'what ports does the
+            proxy need for VMware', 'cloud connectivity', 'database ports')
+        product_name: Optional product to filter results (e.g. 'VBR v13').
+            If omitted, searches across all products.
+        limit: Max results to return (1-100, default 20)
     """
-    entry_lower = entry_service.lower()
-    server_lower = server_service.lower()
+    client = _get_client(ctx)
+    limit = max(1, min(100, limit))
 
-    os_tags = {
-        "(microsoft windows)": "windows",
-        "(linux)": "linux",
-        "(linux/unix)": "linux",
-    }
+    body: dict[str, Any] = {"query": query, "limit": limit}
+    if product_name:
+        body["product"] = product_name
 
-    entry_os = None
-    server_os = None
+    data = await _api_post(client, "/semantic-search", body)
 
-    for tag, os_name in os_tags.items():
-        if tag in entry_lower:
-            entry_os = os_name
-        if tag in server_lower:
-            server_os = os_name
+    results = data.get("results", [])
+    fallback = data.get("fallback", False)
 
-    # Only conflict if BOTH have an OS and they differ
-    if entry_os and server_os and entry_os != server_os:
-        return True
+    if not results:
+        return f"No results for '{query}'."
 
-    return False
+    header = f"Semantic search: '{query}'"
+    if product_name:
+        header += f" (product: {product_name})"
+    if fallback:
+        header += " [keyword fallback]"
+    header += f" — {len(results)} results\n"
+
+    parts = [header]
+    for i, entry in enumerate(results, 1):
+        score = entry.get("similarity", 0)
+        parts.append(f"{i}. (score: {score:.2f})")
+        parts.append(_format_port_entry(entry))
+
+        # Show enriched metadata roles if present
+        for side in ("source_meta", "target_meta"):
+            meta = entry.get(side)
+            if meta and meta.get("roles"):
+                label = "Source" if side == "source_meta" else "Target"
+                roles = ", ".join(meta["roles"])
+                parts.append(f"  {label} roles: {roles}")
+        parts.append("")
+
+    return "\n".join(parts)
 
 
-def _find_server(
-    service_name: str,
-    server_map: dict[str, dict],
-) -> str | None:
-    """Find which user-defined server a port entry's service belongs to.
+@mcp.tool()
+async def get_enriched_ports(product_name: str, ctx: Context) -> str:
+    """Get port data with LLM-parsed service metadata for a product.
 
-    Matching priority:
-    1. Exact match (case-insensitive)
-    2. Normalised match (strip OS qualifiers), with OS conflict rejection
-    3. Bidirectional substring match, with OS conflict rejection
+    Returns the same port entries as get_product_ports, plus enriched
+    metadata for each source and target service (canonical name, roles,
+    OS, hypervisor, storage type). Useful for understanding service
+    relationships and filtering by role.
+
+    Returns 404 if enrichment hasn't been run for this product.
+
+    Args:
+        product_name: Exact product name (e.g. 'VBR v13', 'VB365')
     """
-    svc_lower = service_name.lower().strip()
-    svc_norm = _normalise_service(service_name)
+    client = _get_client(ctx)
 
-    # Pass 1: exact match (case-insensitive)
-    for srv_name, srv in server_map.items():
-        for svc in srv["services"]:
-            if svc.lower().strip() == svc_lower:
-                return srv_name
+    try:
+        entries = await _api_get(
+            client, f"/products/{product_name}/enriched-ports"
+        )
+    except ValueError as exc:
+        if "404" in str(exc):
+            return (
+                f"No enriched data available for '{product_name}'. "
+                "Enrichment may not have been run for this product."
+            )
+        raise
 
-    # Pass 2: normalised match (e.g. "Backup proxy" matches "Backup proxy (Linux)")
-    for srv_name, srv in server_map.items():
-        for svc in srv["services"]:
-            if _normalise_service(svc) == svc_norm:
-                if not _has_conflicting_os(service_name, svc):
-                    return srv_name
+    if not entries:
+        return f"No enriched port data found for '{product_name}'."
 
-    # Pass 3: bidirectional substring on normalised names (with OS conflict check)
-    for srv_name, srv in server_map.items():
-        for svc in srv["services"]:
-            srv_norm = _normalise_service(svc)
-            if srv_norm in svc_norm or svc_norm in srv_norm:
-                if not _has_conflicting_os(service_name, svc):
-                    return srv_name
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for entry in entries:
+        key = entry.get("subheading", "General") or "General"
+        grouped.setdefault(key, []).append(entry)
 
-    return None
+    parts = [
+        f"Enriched port data for {product_name} ({len(entries)} entries)\n"
+    ]
+    for section, items in grouped.items():
+        parts.append(f"### {section}")
+        for i, item in enumerate(items, 1):
+            parts.append(f"\n{i}.")
+            parts.append(_format_port_entry(item))
+            for side, label in (
+                ("source_meta", "Source"),
+                ("target_meta", "Target"),
+            ):
+                meta = item.get(side)
+                if not meta:
+                    continue
+                details = []
+                if meta.get("roles"):
+                    details.append(f"roles={','.join(meta['roles'])}")
+                if meta.get("os"):
+                    details.append(f"os={meta['os']}")
+                if meta.get("hypervisor"):
+                    details.append(f"hv={meta['hypervisor']}")
+                if meta.get("storage_type"):
+                    details.append(f"storage={meta['storage_type']}")
+                if details:
+                    parts.append(f"  {label} meta: {' '.join(details)}")
+        parts.append("")
+
+    return "\n".join(parts)
 
 
-def _build_app_import(
-    port_entries: list[dict[str, Any]],
-    servers: list[dict[str, Any]],
-    product: str,
-) -> list[dict[str, Any]]:
-    """Build the frontend app import JSON structure."""
-    # Create server records with UUIDs
-    server_map: dict[str, dict] = {}
+@mcp.tool()
+async def generate_topology(
+    product_name: str,
+    servers_json: str,
+    ctx: Context,
+    include_loopback: bool = False,
+) -> str:
+    """Resolve server topology — given named servers and their services,
+    returns all port mappings between them as human-readable text.
+
+    Use this when the user describes their server layout and wants to
+    know what firewall rules are needed between servers.
+
+    Args:
+        product_name: Exact product name (e.g. 'VBR v13', 'VB365')
+        servers_json: JSON array of server definitions. Each object must
+            have 'name' (server label) and 'services' (list of service
+            names this server provides). Example:
+            [
+              {"name": "VBR", "services": ["Backup server"]},
+              {"name": "Proxy", "services": ["Backup proxy"]},
+              {"name": "ESXi", "services": ["ESXi host"]}
+            ]
+        include_loopback: Include ports where source and target are the
+            same server (default: false)
+    """
+    client = _get_client(ctx)
+
+    try:
+        servers = json.loads(servers_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid servers_json: {exc}")
+
+    if not isinstance(servers, list):
+        raise ValueError("servers_json must be a JSON array.")
     for srv in servers:
-        srv_id = str(uuid.uuid4())
-        server_map[srv["name"]] = {
-            "id": srv_id,
-            "services": srv["services"],
-            "mappedPorts": [],
-        }
+        if "name" not in srv or "services" not in srv:
+            raise ValueError(
+                "Each server must have 'name' and 'services' fields."
+            )
 
-    # Match each port entry to source and target servers
-    for entry in port_entries:
-        src_service = entry.get("sourceService", "")
-        tgt_service = entry.get("targetService", "")
-        src_server = _find_server(src_service, server_map)
-        tgt_server = _find_server(tgt_service, server_map)
+    topology = await _api_post(
+        client,
+        f"/products/{product_name}/topology",
+        {
+            "servers": servers,
+            "options": {
+                "include_loopback": include_loopback,
+                "include_unresolved": True,
+            },
+        },
+    )
 
-        if not src_server or not tgt_server:
-            continue
-        if src_server == tgt_server:
-            continue
+    result = topology.get("servers", [])
+    metadata = topology.get("metadata", {})
 
-        src_id = server_map[src_server]["id"]
-        tgt_name = tgt_server
+    if not result:
+        unresolved = metadata.get("unresolved_services", [])
+        if unresolved:
+            return (
+                f"No port mappings resolved for '{product_name}'. "
+                f"Unresolved services: {', '.join(unresolved)}"
+            )
+        return f"No port mappings resolved for product '{product_name}'."
 
-        server_map[src_server]["mappedPorts"].append({
-            "sourceServerId": src_id,
-            "sourceServerName": src_server,
-            "targetServerName": tgt_name,
-            "sourceService": src_service,
-            "targetService": tgt_service,
-            "description": entry.get("description", ""),
-            "product": product,
-            "port": entry.get("port", ""),
-            "protocol": entry.get("protocol", ""),
-        })
+    matched = metadata.get("total_entries_matched", 0)
+    skipped = metadata.get("total_entries_skipped", 0)
+    unresolved = metadata.get("unresolved_services", [])
 
-    # Build inbound map: for each server, find all ports targeting it
-    inbound_map: dict[str, list[dict]] = {name: [] for name in server_map}
-    for srv_name, srv in server_map.items():
-        for mp in srv["mappedPorts"]:
-            tgt = mp["targetServerName"]
-            if tgt in inbound_map:
-                inbound_map[tgt].append(mp)
+    parts = [
+        f"Topology for {product_name} "
+        f"({matched} entries matched, {skipped} skipped)\n"
+    ]
 
-    # Build the output structure
-    result = []
-    for srv_name, srv in server_map.items():
-        mapped = srv["mappedPorts"]
+    if unresolved:
+        parts.append(f"Unresolved services: {', '.join(unresolved)}\n")
 
-        # Outbound ports by protocol
-        out_tcp = []
-        out_udp = []
-        for mp in mapped:
-            port = mp["port"]
-            proto = mp.get("protocol", "").upper()
-            if "TCP" in proto and port not in out_tcp:
-                out_tcp.append(port)
-            if "UDP" in proto and port not in out_udp:
-                out_udp.append(port)
+    for srv in result:
+        name = srv["sourceServer"]
+        mapped = srv.get("mappedPorts", [])
+        inbound_count = srv.get("totalMappedInboundPorts", 0)
+        target_count = srv.get("totalMappedServers", 0)
 
-        # Inbound ports by protocol
-        inbound = inbound_map[srv_name]
-        in_tcp = []
-        in_udp = []
-        for mp in inbound:
-            port = mp["port"]
-            proto = mp.get("protocol", "").upper()
-            if "TCP" in proto and port not in in_tcp:
-                in_tcp.append(port)
-            if "UDP" in proto and port not in in_udp:
-                in_udp.append(port)
+        parts.append(
+            f"## {name} "
+            f"({len(mapped)} outbound, {inbound_count} inbound, "
+            f"{target_count} targets)"
+        )
 
-        # Group outbound by target server + protocol
-        outbound_grouped: dict[str, dict[str, list[str]]] = {}
-        for mp in mapped:
-            tgt = mp["targetServerName"]
-            proto = mp.get("protocol", "").upper()
-            outbound_grouped.setdefault(tgt, {}).setdefault(proto, [])
-            if mp["port"] not in outbound_grouped[tgt][proto]:
-                outbound_grouped[tgt][proto].append(mp["port"])
+        # Outbound rules grouped by target
+        by_proto = srv.get("mappedPortsByProtocol", [])
+        if by_proto:
+            parts.append("  Outbound:")
+            for group in by_proto:
+                ports = ", ".join(group["ports"])
+                parts.append(
+                    f"    → {group['server']} "
+                    f"{group['protocol']}: {ports}"
+                )
 
-        mapped_by_proto = []
-        idx = 0
-        for tgt, protocols in outbound_grouped.items():
-            for proto, ports in protocols.items():
-                mapped_by_proto.append({
-                    "index": idx,
-                    "serverName": tgt,
-                    "service": "",
-                    "protocol": proto,
-                    "port": ", ".join(ports),
-                })
-                idx += 1
+        # Inbound rules grouped by source
+        by_proto_in = srv.get("mappedPortsByProtocolInbound", [])
+        if by_proto_in:
+            parts.append("  Inbound:")
+            for group in by_proto_in:
+                ports = ", ".join(group["ports"])
+                parts.append(
+                    f"    ← {group['server']} "
+                    f"{group['protocol']}: {ports}"
+                )
 
-        # Group inbound by source server + protocol
-        inbound_grouped: dict[str, dict[str, list[str]]] = {}
-        for mp in inbound:
-            src = mp["sourceServerName"]
-            proto = mp.get("protocol", "").upper()
-            inbound_grouped.setdefault(src, {}).setdefault(proto, [])
-            if mp["port"] not in inbound_grouped[src][proto]:
-                inbound_grouped[src][proto].append(mp["port"])
+        parts.append("")
 
-        mapped_by_proto_in = []
-        idx = 0
-        for src, protocols in inbound_grouped.items():
-            for proto, ports in protocols.items():
-                mapped_by_proto_in.append({
-                    "index": idx,
-                    "serverName": src,
-                    "service": "",
-                    "protocol": proto,
-                    "port": ", ".join(ports),
-                })
-                idx += 1
+    return "\n".join(parts)
 
-        # Count unique target servers
-        unique_targets = set(mp["targetServerName"] for mp in mapped)
 
-        result.append({
-            "id": srv["id"],
-            "sourceServer": srv_name,
-            "totalMappedPorts": len(mapped),
-            "totalMappedInboundPorts": len(inbound),
-            "totalMappedServers": len(unique_targets),
-            "mappedPorts": mapped,
-            "allInboundPortsTcp": in_tcp,
-            "allInboundPortsUdp": in_udp,
-            "allOutboundPortsTcp": out_tcp,
-            "allOutboundPortsUdp": out_udp,
-            "mappedPortsByProtocol": mapped_by_proto,
-            "mappedPortsByProtocolInbound": mapped_by_proto_in,
-        })
-
-    return result
-
+# ---------------------------------------------------------------------------
+# App import / topology tools
+# ---------------------------------------------------------------------------
 
 @mcp.tool()
 async def generate_app_import(
@@ -544,13 +577,9 @@ async def generate_app_import(
 ) -> str:
     """Generate a JSON file for importing into the Magic Ports frontend app.
 
-    Creates the port mapping topology structure that the Angular frontend
-    can import. You must define the servers in your environment and which
-    services each server provides.
-
-    The full JSON is written to a file on disk. The tool returns the file
-    path and a summary of the generated data. Present the file path to the
-    user so they can import it into the Magic Ports app.
+    Resolves the port mapping topology between user-defined servers using
+    the enriched knowledge graph on the API server. The full JSON is
+    written to a file on disk and a compact summary is returned.
 
     Workflow:
     1. Call get_source_details to see available services for the product.
@@ -587,11 +616,20 @@ async def generate_app_import(
                 "Each server must have 'name' and 'services' fields."
             )
 
-    entries = await _api_get(client, f"/products/{product_name}/ports")
-    if not entries:
-        return f"No port data found for product '{product_name}'."
+    result = await _api_post(
+        client,
+        f"/products/{product_name}/app-import",
+        {
+            "servers": servers,
+            "options": {
+                "include_loopback": False,
+                "include_unresolved": False,
+            },
+        },
+    )
 
-    result = _build_app_import(entries, servers, product_name)
+    if not result:
+        return f"No port mappings resolved for product '{product_name}'."
 
     # Write full JSON to file, return compact summary
     if output_dir:
@@ -626,8 +664,8 @@ async def generate_app_import(
         target_count = srv.get("totalMappedServers", 0)
         summary_lines.append(
             f"  {srv['sourceServer']}: "
-            f"{mapped_count} outbound ports, "
-            f"{inbound_count} inbound ports, "
+            f"{mapped_count} mapped ports, "
+            f"{inbound_count} inbound, "
             f"{target_count} target servers"
         )
 
