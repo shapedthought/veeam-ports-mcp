@@ -76,14 +76,20 @@ mcp = FastMCP(
         "5. Use search_ports for broad keyword searches across all products.\n"
         "6. Use search_by_port_number to find all products using a given port.\n\n"
         "Server topology:\n"
+        "- Use list_services to discover valid service role names for a product "
+        "before building server definitions.\n"
         "- Use generate_topology when the user describes their server layout "
         "and wants to know what firewall rules are needed between servers.\n"
         "- Use generate_app_import to create a JSON import file for the "
         "Magic Ports frontend app. The tool writes the file to disk and "
         "returns the file path + summary. Present the file to the user "
         "for download.\n"
-        "- For both tools, first call get_source_details to see available "
-        "services, then ask the user which servers they have.\n\n"
+        "- Both topology tools support exclude_subsections and exclude_ports "
+        "to filter out irrelevant sections (e.g. CDP) or specific ports.\n"
+        "- Both tools support format='csv' or format='markdown' for "
+        "alternative output formats.\n"
+        "- If a service name is not recognized, the API returns warnings "
+        "with fuzzy match suggestions — present these to the user.\n\n"
         "Tips:\n"
         "- Port entries include source service, target service, port, protocol, "
         "and description fields.\n"
@@ -454,6 +460,9 @@ async def generate_topology(
     servers_json: str,
     ctx: Context,
     include_loopback: bool = False,
+    exclude_subsections: str | None = None,
+    exclude_ports: str | None = None,
+    format: str = "json",
 ) -> str:
     """Resolve server topology — given named servers and their services,
     returns all port mappings between them as human-readable text.
@@ -473,6 +482,12 @@ async def generate_topology(
             ]
         include_loopback: Include ports where source and target are the
             same server (default: false)
+        exclude_subsections: Optional JSON array of subsection names to
+            exclude from the results (e.g. '["CDP Components"]')
+        exclude_ports: Optional JSON array of port numbers to exclude
+            from the results (e.g. '["33035"]')
+        format: Output format — 'json' (default), 'csv', or 'markdown'.
+            csv and markdown return the raw content as text.
     """
     client = _get_client(ctx)
 
@@ -489,16 +504,40 @@ async def generate_topology(
                 "Each server must have 'name' and 'services' fields."
             )
 
+    options: dict[str, Any] = {
+        "include_loopback": include_loopback,
+        "include_unresolved": True,
+    }
+    if exclude_subsections:
+        try:
+            options["exclude_subsections"] = json.loads(exclude_subsections)
+        except json.JSONDecodeError:
+            raise ValueError("exclude_subsections must be a valid JSON array.")
+    if exclude_ports:
+        try:
+            options["exclude_ports"] = json.loads(exclude_ports)
+        except json.JSONDecodeError:
+            raise ValueError("exclude_ports must be a valid JSON array.")
+
+    body = {"servers": servers, "options": options}
+
+    # For csv/markdown, fetch raw text directly
+    if format in ("csv", "markdown"):
+        try:
+            resp = await client.post(
+                f"/products/{product_name}/topology",
+                json=body,
+                params={"format": format},
+            )
+            resp.raise_for_status()
+            return resp.text
+        except Exception as exc:
+            raise ValueError(f"API error fetching {format} format: {exc}")
+
     topology = await _api_post(
         client,
         f"/products/{product_name}/topology",
-        {
-            "servers": servers,
-            "options": {
-                "include_loopback": include_loopback,
-                "include_unresolved": True,
-            },
-        },
+        body,
     )
 
     result = topology.get("servers", [])
@@ -516,6 +555,7 @@ async def generate_topology(
     matched = metadata.get("total_entries_matched", 0)
     skipped = metadata.get("total_entries_skipped", 0)
     unresolved = metadata.get("unresolved_services", [])
+    warnings = metadata.get("warnings", [])
 
     parts = [
         f"Topology for {product_name} "
@@ -524,6 +564,16 @@ async def generate_topology(
 
     if unresolved:
         parts.append(f"Unresolved services: {', '.join(unresolved)}\n")
+
+    if warnings:
+        parts.append("Warnings:")
+        for w in warnings:
+            msg = f"  - '{w['service']}' on server '{w['server']}' could not be resolved"
+            suggestions = w.get("suggestions", [])
+            if suggestions:
+                msg += f". Did you mean: {', '.join(suggestions)}?"
+            parts.append(msg)
+        parts.append("")
 
     for srv in result:
         name = srv["sourceServer"]
@@ -565,6 +615,65 @@ async def generate_topology(
 
 
 # ---------------------------------------------------------------------------
+# Service discovery
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def list_services(product_name: str, ctx: Context) -> str:
+    """List all known service roles for a product from the knowledge graph.
+
+    Returns canonical service names with their original name variants
+    and any OS/hypervisor/storage qualifiers. Useful for discovering
+    valid service names before calling generate_topology or
+    generate_app_import.
+
+    Args:
+        product_name: Exact product name (e.g. 'VBR v13', 'VB365')
+    """
+    client = _get_client(ctx)
+
+    try:
+        services = await _api_get(
+            client, f"/products/{product_name}/services"
+        )
+    except ValueError as exc:
+        if "404" in str(exc):
+            return (
+                f"No services found for '{product_name}'. "
+                "The knowledge graph may not have been built for this product."
+            )
+        raise
+
+    if not services:
+        return f"No services found for product '{product_name}'."
+
+    parts = [
+        f"Services for {product_name} ({len(services)} canonical roles):\n"
+    ]
+    for svc in services:
+        canonical = svc.get("canonical", "Unknown")
+        originals = svc.get("original_names", [])
+        os_list = svc.get("os", [])
+        hv_list = svc.get("hypervisor", [])
+        storage_list = svc.get("storage_type", [])
+
+        parts.append(f"- **{canonical}**")
+        if originals and originals != [canonical]:
+            parts.append(f"    Names: {', '.join(originals)}")
+        qualifiers = []
+        if os_list:
+            qualifiers.append(f"OS: {', '.join(os_list)}")
+        if hv_list:
+            qualifiers.append(f"Hypervisor: {', '.join(hv_list)}")
+        if storage_list:
+            qualifiers.append(f"Storage: {', '.join(storage_list)}")
+        if qualifiers:
+            parts.append(f"    {' | '.join(qualifiers)}")
+
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # App import / topology tools
 # ---------------------------------------------------------------------------
 
@@ -574,6 +683,9 @@ async def generate_app_import(
     servers_json: str,
     ctx: Context,
     output_dir: str | None = None,
+    exclude_subsections: str | None = None,
+    exclude_ports: str | None = None,
+    format: str = "json",
 ) -> str:
     """Generate a JSON file for importing into the Magic Ports frontend app.
 
@@ -582,7 +694,7 @@ async def generate_app_import(
     written to a file on disk and a compact summary is returned.
 
     Workflow:
-    1. Call get_source_details to see available services for the product.
+    1. Call list_services to see available service roles for the product.
     2. Ask the user which servers they have and what roles they serve.
     3. Call this tool with the server definitions.
     4. Present the generated file to the user for download/import.
@@ -600,6 +712,12 @@ async def generate_app_import(
             ]
         output_dir: Optional directory to write the file to. Defaults to
             ~/Documents/veeam-ports-exports or VEEAM_PORTS_OUTPUT_DIR env var.
+        exclude_subsections: Optional JSON array of subsection names to
+            exclude from the results (e.g. '["CDP Components"]')
+        exclude_ports: Optional JSON array of port numbers to exclude
+            from the results (e.g. '["33035"]')
+        format: Output format — 'json' (default), 'csv', or 'markdown'.
+            csv and markdown return the raw content as text (no file written).
     """
     client = _get_client(ctx)
 
@@ -616,19 +734,50 @@ async def generate_app_import(
                 "Each server must have 'name' and 'services' fields."
             )
 
+    options: dict[str, Any] = {
+        "include_loopback": False,
+        "include_unresolved": False,
+    }
+    if exclude_subsections:
+        try:
+            options["exclude_subsections"] = json.loads(exclude_subsections)
+        except json.JSONDecodeError:
+            raise ValueError("exclude_subsections must be a valid JSON array.")
+    if exclude_ports:
+        try:
+            options["exclude_ports"] = json.loads(exclude_ports)
+        except json.JSONDecodeError:
+            raise ValueError("exclude_ports must be a valid JSON array.")
+
+    body = {"servers": servers, "options": options}
+
+    # For csv/markdown, fetch raw text directly
+    if format in ("csv", "markdown"):
+        try:
+            resp = await client.post(
+                f"/products/{product_name}/app-import",
+                json=body,
+                params={"format": format},
+            )
+            resp.raise_for_status()
+            return resp.text
+        except Exception as exc:
+            raise ValueError(f"API error fetching {format} format: {exc}")
+
     result = await _api_post(
         client,
         f"/products/{product_name}/app-import",
-        {
-            "servers": servers,
-            "options": {
-                "include_loopback": False,
-                "include_unresolved": False,
-            },
-        },
+        body,
     )
 
     if not result:
+        return f"No port mappings resolved for product '{product_name}'."
+
+    # Response is now an object with 'servers' and 'warnings'
+    server_list = result.get("servers", [])
+    warnings = result.get("warnings", [])
+
+    if not server_list:
         return f"No port mappings resolved for product '{product_name}'."
 
     # Write full JSON to file, return compact summary
@@ -654,11 +803,11 @@ async def generate_app_import(
         f"File: {filepath}",
         f"Size: {file_size:,} bytes",
         f"Product: {product_name}",
-        f"Servers: {len(result)}",
+        f"Servers: {len(server_list)}",
         "",
     ]
 
-    for srv in result:
+    for srv in server_list:
         mapped_count = len(srv.get("mappedPorts", []))
         inbound_count = srv.get("totalMappedInboundPorts", 0)
         target_count = srv.get("totalMappedServers", 0)
@@ -668,6 +817,16 @@ async def generate_app_import(
             f"{inbound_count} inbound, "
             f"{target_count} target servers"
         )
+
+    if warnings:
+        summary_lines.append("")
+        summary_lines.append("Warnings:")
+        for w in warnings:
+            msg = f"  - '{w['service']}' on server '{w['server']}' could not be resolved"
+            suggestions = w.get("suggestions", [])
+            if suggestions:
+                msg += f". Did you mean: {', '.join(suggestions)}?"
+            summary_lines.append(msg)
 
     summary_lines.append("")
     summary_lines.append(
