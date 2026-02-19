@@ -110,6 +110,19 @@ def _get_client(ctx: Context) -> httpx.AsyncClient:
     return ctx.request_context.lifespan_context.client
 
 
+def _parse_list_param(value: list[str] | str | None) -> list[str] | None:
+    """Normalize a parameter that may arrive as a JSON string or native list.
+
+    MCP clients may auto-deserialize JSON array strings into Python lists
+    before they reach the tool function. This helper accepts either form.
+    """
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return value
+    return json.loads(value)
+
+
 def _get_output_dir() -> str:
     """Get (and create if needed) the output directory for generated files."""
     d = OUTPUT_DIR
@@ -460,8 +473,8 @@ async def generate_topology(
     servers_json: str,
     ctx: Context,
     include_loopback: bool = False,
-    exclude_subsections: str | None = None,
-    exclude_ports: str | None = None,
+    exclude_subsections: list[str] | str | None = None,
+    exclude_ports: list[str] | str | None = None,
     format: str = "json",
 ) -> str:
     """Resolve server topology — given named servers and their services,
@@ -482,10 +495,10 @@ async def generate_topology(
             ]
         include_loopback: Include ports where source and target are the
             same server (default: false)
-        exclude_subsections: Optional JSON array of subsection names to
-            exclude from the results (e.g. '["CDP Components"]')
-        exclude_ports: Optional JSON array of port numbers to exclude
-            from the results (e.g. '["33035"]')
+        exclude_subsections: Subsection names to exclude from results
+            (e.g. ["CDP Components"]). Accepts a list or JSON string.
+        exclude_ports: Port numbers to exclude from results
+            (e.g. ["33035"]). Accepts a list or JSON string.
         format: Output format — 'json' (default), 'csv', or 'markdown'.
             csv and markdown return the raw content as text.
     """
@@ -508,16 +521,12 @@ async def generate_topology(
         "include_loopback": include_loopback,
         "include_unresolved": True,
     }
-    if exclude_subsections:
-        try:
-            options["exclude_subsections"] = json.loads(exclude_subsections)
-        except json.JSONDecodeError:
-            raise ValueError("exclude_subsections must be a valid JSON array.")
-    if exclude_ports:
-        try:
-            options["exclude_ports"] = json.loads(exclude_ports)
-        except json.JSONDecodeError:
-            raise ValueError("exclude_ports must be a valid JSON array.")
+    parsed_subsections = _parse_list_param(exclude_subsections)
+    if parsed_subsections:
+        options["exclude_subsections"] = parsed_subsections
+    parsed_ports = _parse_list_param(exclude_ports)
+    if parsed_ports:
+        options["exclude_ports"] = parsed_ports
 
     body = {"servers": servers, "options": options}
 
@@ -683,8 +692,8 @@ async def generate_app_import(
     servers_json: str,
     ctx: Context,
     output_dir: str | None = None,
-    exclude_subsections: str | None = None,
-    exclude_ports: str | None = None,
+    exclude_subsections: list[str] | str | None = None,
+    exclude_ports: list[str] | str | None = None,
     format: str = "json",
 ) -> str:
     """Generate a JSON file for importing into the Magic Ports frontend app.
@@ -708,14 +717,14 @@ async def generate_app_import(
               {"name": "VBR", "services": ["Backup server"]},
               {"name": "Proxy", "services": ["Backup proxy"]},
               {"name": "Repo", "services": ["Backup repository"]},
-              {"name": "ESXi", "services": ["ESXi server", "vCenter Server"]}
+              {"name": "ESXi", "services": ["ESXi host", "vCenter Server"]}
             ]
         output_dir: Optional directory to write the file to. Defaults to
             ~/Documents/veeam-ports-exports or VEEAM_PORTS_OUTPUT_DIR env var.
-        exclude_subsections: Optional JSON array of subsection names to
-            exclude from the results (e.g. '["CDP Components"]')
-        exclude_ports: Optional JSON array of port numbers to exclude
-            from the results (e.g. '["33035"]')
+        exclude_subsections: Subsection names to exclude from results
+            (e.g. ["CDP Components"]). Accepts a list or JSON string.
+        exclude_ports: Port numbers to exclude from results
+            (e.g. ["33035"]). Accepts a list or JSON string.
         format: Output format — 'json' (default), 'csv', or 'markdown'.
             csv and markdown return the raw content as text (no file written).
     """
@@ -738,16 +747,12 @@ async def generate_app_import(
         "include_loopback": False,
         "include_unresolved": False,
     }
-    if exclude_subsections:
-        try:
-            options["exclude_subsections"] = json.loads(exclude_subsections)
-        except json.JSONDecodeError:
-            raise ValueError("exclude_subsections must be a valid JSON array.")
-    if exclude_ports:
-        try:
-            options["exclude_ports"] = json.loads(exclude_ports)
-        except json.JSONDecodeError:
-            raise ValueError("exclude_ports must be a valid JSON array.")
+    parsed_subsections = _parse_list_param(exclude_subsections)
+    if parsed_subsections:
+        options["exclude_subsections"] = parsed_subsections
+    parsed_ports = _parse_list_param(exclude_ports)
+    if parsed_ports:
+        options["exclude_ports"] = parsed_ports
 
     body = {"servers": servers, "options": options}
 
@@ -792,7 +797,7 @@ async def generate_app_import(
     filepath = os.path.join(dest, filename)
 
     with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2)
+        json.dump(server_list, f, indent=2)
 
     file_size = os.path.getsize(filepath)
 
